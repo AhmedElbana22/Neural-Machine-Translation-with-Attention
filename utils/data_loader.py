@@ -1,6 +1,7 @@
-import pathlib
+import os
 import numpy as np
 import tensorflow as tf
+import pathlib
 import re
 import unicodedata
 
@@ -22,42 +23,50 @@ def load_data(path):
     
     return context, target
 
-def unicode_to_ascii(text):
-    """Normalize unicode characters to ASCII"""
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', text)
-        if unicodedata.category(c) != 'Mn'
-    )
-
-def preprocess_sentence(sentence):
-    """Preprocess a single sentence"""
-    sentence = unicode_to_ascii(sentence.lower().strip())
-    sentence = re.sub(r"([?.!,¿])", r" \1 ", sentence)
-    sentence = re.sub(r'[" "]+', " ", sentence)
-    sentence = re.sub(r"[^a-zA-Z?.!,¿]+", " ", sentence)
-    sentence = sentence.strip()
-    sentence = '[SOS] ' + sentence + ' [EOS]'
-    return sentence
-
 class CustomStandardization(tf.keras.layers.Layer):
-    """Custom text standardization layer to replace tensorflow-text"""
+    """Custom text standardization layer (replaces tf_text.normalize_utf8)"""
     
     def call(self, inputs):
-        lowercase = tf.strings.lower(inputs)
-        cleaned = tf.strings.regex_replace(lowercase, "[^ a-z.?!,¿]", "")
-        spaced = tf.strings.regex_replace(cleaned, "[.?!,¿]", r" \0 ")
-        stripped = tf.strings.strip(spaced)
-        result = tf.strings.join(["[SOS]", stripped, "[EOS]"], separator=" ")
-        return result
+        # Lowercase
+        text = tf.strings.lower(inputs)
+        # Remove characters except letters, spaces, and punctuation
+        text = tf.strings.regex_replace(text, "[^ a-z.?!,¿]", "")
+        # Add spaces around punctuation
+        text = tf.strings.regex_replace(text, "[.?!,¿]", r" \0 ")
+        # Strip whitespace
+        text = tf.strings.strip(text)
+        # Add SOS and EOS tokens
+        text = tf.strings.join(["[SOS]", text, "[EOS]"], separator=" ")
+        return text
 
-def prepare_datasets(data_path="data/por-eng/por.txt"):
+def prepare_datasets(data_path=None):
     """Prepare training and validation datasets"""
     global BUFFER_SIZE
     
-    path_to_file = pathlib.Path(data_path)
+    # Auto-detect data path if not provided
+    if data_path is None:
+        current_file = pathlib.Path(__file__).resolve()
+        project_root = current_file.parent.parent
+        path_to_file = project_root / "data" / "por-eng" / "por.txt"
+    else:
+        path_to_file = pathlib.Path(data_path)
+    
+    # Check if file exists
+    if not path_to_file.exists():
+        raise FileNotFoundError(
+            f"Data file not found at: {path_to_file}\n"
+            f"Expected location: {path_to_file.resolve()}\n"
+            f"Current working directory: {os.getcwd()}"
+        )
+    
+    print(f"Loading data from: {path_to_file}")
+    
+    # Load data
     portuguese_sentences, english_sentences = load_data(path_to_file)
     
     BUFFER_SIZE = len(english_sentences)
+    
+    # Split train/val
     is_train = np.random.uniform(size=(len(portuguese_sentences),)) < 0.8
     
     train_raw = (
@@ -76,8 +85,10 @@ def prepare_datasets(data_path="data/por-eng/por.txt"):
         .batch(BATCH_SIZE)
     )
     
+    # Create custom standardization
     custom_standardization = CustomStandardization()
     
+    # Create vectorizers
     english_vectorizer = tf.keras.layers.TextVectorization(
         standardize=custom_standardization,
         max_tokens=MAX_VOCAB_SIZE,
@@ -92,19 +103,21 @@ def prepare_datasets(data_path="data/por-eng/por.txt"):
     )
     portuguese_vectorizer.adapt(train_raw.map(lambda context, target: target))
     
+    # Process text function (matches original)
     def process_text(context, target):
         context = english_vectorizer(context).to_tensor()
-        target = portuguese_vectorizer(target).to_tensor()
-        target_input = target[:, :-1]
-        target_output = target[:, 1:]
-        return (context, target_input), target_output
+        target = portuguese_vectorizer(target)
+        targ_in = target[:, :-1].to_tensor()
+        targ_out = target[:, 1:].to_tensor()
+        return (context, targ_in), targ_out
     
-    train_data = train_raw.map(process_text, tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    val_data = val_raw.map(process_text, tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+    train_data = train_raw.map(process_text, tf.data.AUTOTUNE)
+    val_data = val_raw.map(process_text, tf.data.AUTOTUNE)
     
     return train_data, val_data, english_vectorizer, portuguese_vectorizer
 
 def tokens_to_text(tokens, id_to_word):
     """Convert token IDs to text"""
     words = id_to_word(tokens)
-    return tf.strings.reduce_join(words, axis=-1, separator=' ')
+    result = tf.strings.reduce_join(words, axis=-1, separator=" ")
+    return result
